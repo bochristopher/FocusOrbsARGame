@@ -2,6 +2,10 @@ package com.example.focusorbsargame
 
 import android.animation.AnimatorSet
 import android.animation.ObjectAnimator
+import android.hardware.Sensor
+import android.hardware.SensorEvent
+import android.hardware.SensorEventListener
+import android.hardware.SensorManager
 import android.os.Bundle
 import android.view.Choreographer
 import android.view.View
@@ -19,41 +23,65 @@ import kotlin.random.Random
 /**
  * FocusOrbsActivity - Core game loop for the Focus Orbs AR game.
  *
- * Game mechanics:
- * - A reticle is fixed at the center of the screen
- * - An orb spawns at a random position and slowly moves toward the center
- * - When the orb overlaps the reticle for a sustained duration, it "pops"
- * - Score increases and a new orb spawns
+ * Step 2 Implementation:
+ * - Head tilt (device orientation) controls the virtual aim point
+ * - The reticle stays visually fixed at center
+ * - Internally, aim offset is computed from pitch/roll deltas
+ * - Basic difficulty system: levels increase every 5 pops
  *
- * For Step 1: The orb auto-moves toward center to simulate head tracking.
- * In later steps, this will be replaced with actual head/gaze input.
+ * Game mechanics:
+ * - A reticle is fixed at the center of the screen (visual only)
+ * - An orb spawns at a random position and stays there
+ * - Player tilts head to move the virtual "aim point"
+ * - When aim point is close to orb for required duration, orb "pops"
+ * - Score increases, difficulty ramps up, new orb spawns
  */
-class FocusOrbsActivity : AppCompatActivity(), Choreographer.FrameCallback {
+class FocusOrbsActivity : AppCompatActivity(), Choreographer.FrameCallback, SensorEventListener {
 
     // ==================== View Binding ====================
     private lateinit var binding: ActivityFocusOrbsBinding
 
     // ==================== Game State ====================
     private var score: Int = 0
+    private var level: Int = 1
     private var isGameRunning: Boolean = false
 
-    // ==================== Orb Position & Movement ====================
+    // ==================== Orb Position ====================
     // Current orb position (center of the orb in screen coordinates)
+    // In Step 2: Orb stays fixed after spawning; player moves aim point via head tilt
     private var orbX: Float = 0f
     private var orbY: Float = 0f
 
-    // Movement speed (pixels per second) - orb drifts toward center
-    private val orbSpeed: Float = 120f
+    // ==================== Difficulty Parameters ====================
+    // These are adjusted based on current level
+    private var captureRadius: Float = BASE_CAPTURE_RADIUS
+    private var requiredFocusTime: Float = BASE_FOCUS_TIME
 
     // ==================== Focus/Alignment Tracking ====================
-    // Radius within which the orb is considered "aligned" with reticle
-    private val alignmentRadius: Float = 60f
-
-    // Time required to hold alignment before orb pops (in seconds)
-    private val requiredFocusTime: Float = 0.6f
-
-    // Accumulated focus time while aligned
+    // Accumulated focus time while aim point is within capture radius of orb
     private var currentFocusTime: Float = 0f
+
+    // ==================== Head Tilt / Orientation ====================
+    private lateinit var sensorManager: SensorManager
+    private var rotationVectorSensor: Sensor? = null
+
+    // Neutral orientation (captured when game starts or recalibrates)
+    private var neutralPitch: Float = 0f
+    private var neutralRoll: Float = 0f
+    private var hasNeutralOrientation: Boolean = false
+
+    // Current orientation from sensor
+    private var currentPitch: Float = 0f
+    private var currentRoll: Float = 0f
+
+    // Virtual aim offset from center (computed from head tilt)
+    // This represents how far the aim point has moved from screen center
+    private var aimOffsetX: Float = 0f
+    private var aimOffsetY: Float = 0f
+
+    // Rotation matrix and orientation arrays (reused to avoid allocation)
+    private val rotationMatrix = FloatArray(9)
+    private val orientationAngles = FloatArray(3)
 
     // ==================== Timing ====================
     private var lastFrameTimeNanos: Long = 0L
@@ -64,12 +92,36 @@ class FocusOrbsActivity : AppCompatActivity(), Choreographer.FrameCallback {
     private var orbSize: Int = 0
     private var reticleSize: Int = 0
 
-    // Screen center coordinates (where the reticle is)
+    // Screen center coordinates (where the reticle is visually positioned)
     private var centerX: Float = 0f
     private var centerY: Float = 0f
 
     // ==================== Animation State ====================
     private var isPopping: Boolean = false
+
+    // ==================== Constants ====================
+    companion object {
+        // Base difficulty values (Level 1)
+        private const val BASE_CAPTURE_RADIUS = 80f      // pixels - distance within which aim counts as "on target"
+        private const val BASE_FOCUS_TIME = 0.5f         // seconds - time to hold aim on target to pop
+
+        // Difficulty scaling per level
+        private const val CAPTURE_RADIUS_DECREASE_PER_LEVEL = 8f   // pixels smaller each level
+        private const val FOCUS_TIME_INCREASE_PER_LEVEL = 0.05f    // seconds longer each level
+        private const val MIN_CAPTURE_RADIUS = 35f                  // minimum capture radius (don't go below this)
+        private const val MAX_FOCUS_TIME = 1.2f                     // maximum focus time
+
+        // Pops required to level up
+        private const val POPS_PER_LEVEL = 5
+
+        // Head tilt sensitivity: how many pixels of aim offset per radian of tilt
+        // Higher = more sensitive, aim moves more for same head tilt
+        private const val TILT_SENSITIVITY_X = 400f   // pixels per radian for roll (left/right tilt)
+        private const val TILT_SENSITIVITY_Y = 400f   // pixels per radian for pitch (up/down tilt)
+
+        // Maximum aim offset from center (prevents aiming off-screen)
+        private const val MAX_AIM_OFFSET = 350f
+    }
 
     // ==================== Lifecycle ====================
 
@@ -86,24 +138,95 @@ class FocusOrbsActivity : AppCompatActivity(), Choreographer.FrameCallback {
         // Enable immersive fullscreen mode
         setupFullscreen()
 
+        // Initialize sensor manager
+        sensorManager = getSystemService(SENSOR_SERVICE) as SensorManager
+        rotationVectorSensor = sensorManager.getDefaultSensor(Sensor.TYPE_ROTATION_VECTOR)
+
         // Initialize UI
         updateScoreDisplay()
+        updateLevelDisplay()
 
         // Wait for layout to be measured before starting game
         binding.gameContainer.post {
             initializeGameDimensions()
+            updateDifficultyForLevel()
             spawnNewOrb()
         }
     }
 
     override fun onResume() {
         super.onResume()
+
+        // Register sensor listener for head tracking
+        rotationVectorSensor?.let { sensor ->
+            sensorManager.registerListener(
+                this,
+                sensor,
+                SensorManager.SENSOR_DELAY_GAME  // ~20ms updates, good for games
+            )
+        }
+
+        // Reset neutral orientation so it recalibrates when player resumes
+        hasNeutralOrientation = false
+
         startGameLoop()
     }
 
     override fun onPause() {
         super.onPause()
+
+        // Unregister sensor listener to save battery
+        sensorManager.unregisterListener(this)
+
         stopGameLoop()
+    }
+
+    // ==================== Sensor Event Handling ====================
+
+    /**
+     * Called when sensor values change.
+     * We extract pitch and roll from the rotation vector to determine head tilt.
+     */
+    override fun onSensorChanged(event: SensorEvent?) {
+        if (event?.sensor?.type != Sensor.TYPE_ROTATION_VECTOR) return
+
+        // Convert rotation vector to rotation matrix
+        SensorManager.getRotationMatrixFromVector(rotationMatrix, event.values)
+
+        // Get orientation angles: [azimuth, pitch, roll]
+        // azimuth: rotation around Z axis (compass direction) - not used
+        // pitch: rotation around X axis (tilting phone forward/back)
+        // roll: rotation around Y axis (tilting phone left/right)
+        SensorManager.getOrientation(rotationMatrix, orientationAngles)
+
+        currentPitch = orientationAngles[1]  // radians, negative = tilted forward
+        currentRoll = orientationAngles[2]   // radians, positive = tilted right
+
+        // Capture neutral orientation on first stable reading
+        if (!hasNeutralOrientation) {
+            neutralPitch = currentPitch
+            neutralRoll = currentRoll
+            hasNeutralOrientation = true
+        }
+
+        // Compute delta from neutral orientation
+        val deltaPitch = currentPitch - neutralPitch
+        val deltaRoll = currentRoll - neutralRoll
+
+        // Map pitch/roll deltas to aim offset in screen pixels
+        // Roll (left/right tilt) → horizontal aim offset (X)
+        // Pitch (forward/back tilt) → vertical aim offset (Y)
+        //
+        // Note: The mapping may need adjustment based on device orientation.
+        // For portrait mode:
+        //   - Roll right (positive) → aim moves right (+X)
+        //   - Pitch forward (negative) → aim moves up (-Y in screen coords)
+        aimOffsetX = (deltaRoll * TILT_SENSITIVITY_X).coerceIn(-MAX_AIM_OFFSET, MAX_AIM_OFFSET)
+        aimOffsetY = (-deltaPitch * TILT_SENSITIVITY_Y).coerceIn(-MAX_AIM_OFFSET, MAX_AIM_OFFSET)
+    }
+
+    override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {
+        // Not used, but required by SensorEventListener interface
     }
 
     // ==================== Fullscreen Setup ====================
@@ -133,6 +256,34 @@ class FocusOrbsActivity : AppCompatActivity(), Choreographer.FrameCallback {
         // Calculate center of screen (where reticle is positioned)
         centerX = screenWidth / 2f
         centerY = screenHeight / 2f
+    }
+
+    // ==================== Difficulty System ====================
+
+    /**
+     * Update difficulty parameters based on current level.
+     * Higher levels = smaller capture radius, longer hold time.
+     */
+    private fun updateDifficultyForLevel() {
+        // Decrease capture radius as level increases (harder to aim)
+        captureRadius = (BASE_CAPTURE_RADIUS - (level - 1) * CAPTURE_RADIUS_DECREASE_PER_LEVEL)
+            .coerceAtLeast(MIN_CAPTURE_RADIUS)
+
+        // Increase required focus time as level increases (need to hold longer)
+        requiredFocusTime = (BASE_FOCUS_TIME + (level - 1) * FOCUS_TIME_INCREASE_PER_LEVEL)
+            .coerceAtMost(MAX_FOCUS_TIME)
+    }
+
+    /**
+     * Check if player should level up based on score.
+     */
+    private fun checkLevelUp() {
+        val newLevel = (score / POPS_PER_LEVEL) + 1
+        if (newLevel > level) {
+            level = newLevel
+            updateDifficultyForLevel()
+            updateLevelDisplay()
+        }
     }
 
     // ==================== Game Loop ====================
@@ -186,45 +337,11 @@ class FocusOrbsActivity : AppCompatActivity(), Choreographer.FrameCallback {
         // Don't update if we're in the middle of a pop animation
         if (isPopping) return
 
-        // Move orb toward center (simulated head tracking for Step 1)
-        moveOrbTowardCenter(deltaTime)
-
-        // Update orb visual position
-        updateOrbPosition()
-
-        // Check alignment and handle focus timer
+        // Check alignment between virtual aim point and orb
         checkAlignment(deltaTime)
     }
 
-    // ==================== Orb Movement ====================
-
-    /**
-     * Move the orb toward the screen center.
-     * In Step 1, this simulates the player "aiming" with their head.
-     * Later, this will be replaced with actual head tracking input.
-     */
-    private fun moveOrbTowardCenter(deltaTime: Float) {
-        // Calculate direction toward center
-        val dx = centerX - orbX
-        val dy = centerY - orbY
-
-        // Calculate distance to center
-        val distance = hypot(dx, dy)
-
-        // If we're very close to center, don't move (avoid jitter)
-        if (distance < 2f) {
-            orbX = centerX
-            orbY = centerY
-            return
-        }
-
-        // Normalize direction and apply speed
-        val moveDistance = orbSpeed * deltaTime
-        val actualMove = moveDistance.coerceAtMost(distance)
-
-        orbX += (dx / distance) * actualMove
-        orbY += (dy / distance) * actualMove
-    }
+    // ==================== Orb Position ====================
 
     /**
      * Update the orb View's position to match our logical position.
@@ -239,15 +356,24 @@ class FocusOrbsActivity : AppCompatActivity(), Choreographer.FrameCallback {
     // ==================== Alignment & Focus ====================
 
     /**
-     * Check if the orb is aligned with the reticle (within alignment radius).
-     * If aligned, accumulate focus time. If not, reset.
+     * Check if the virtual aim point is aligned with the orb.
+     *
+     * The aim point is: (centerX + aimOffsetX, centerY + aimOffsetY)
+     * This represents where the player is "looking" based on head tilt.
+     *
+     * If the aim point is within captureRadius of the orb center,
+     * we accumulate focus time. Otherwise, we reset.
      */
     private fun checkAlignment(deltaTime: Float) {
-        // Calculate distance from orb center to screen center
-        val distance = hypot(orbX - centerX, orbY - centerY)
+        // Calculate the virtual aim point based on head tilt
+        val aimX = centerX + aimOffsetX
+        val aimY = centerY + aimOffsetY
 
-        if (distance <= alignmentRadius) {
-            // Orb is aligned - accumulate focus time
+        // Calculate distance from aim point to orb center
+        val distance = hypot(aimX - orbX, aimY - orbY)
+
+        if (distance <= captureRadius) {
+            // Aim point is on target - accumulate focus time
             currentFocusTime += deltaTime
 
             // Show and update progress bar
@@ -260,7 +386,7 @@ class FocusOrbsActivity : AppCompatActivity(), Choreographer.FrameCallback {
                 popOrb()
             }
         } else {
-            // Orb is not aligned - reset focus timer
+            // Aim point is off target - reset focus timer
             currentFocusTime = 0f
             binding.focusProgressBar.visibility = View.INVISIBLE
             binding.focusProgressBar.progress = 0
@@ -270,7 +396,7 @@ class FocusOrbsActivity : AppCompatActivity(), Choreographer.FrameCallback {
     // ==================== Orb Pop & Respawn ====================
 
     /**
-     * Pop the orb with a flash animation, increment score, and spawn new orb.
+     * Pop the orb with a flash animation, increment score, check level up, spawn new orb.
      */
     private fun popOrb() {
         isPopping = true
@@ -280,6 +406,9 @@ class FocusOrbsActivity : AppCompatActivity(), Choreographer.FrameCallback {
         // Increment score
         score++
         updateScoreDisplay()
+
+        // Check for level up
+        checkLevelUp()
 
         // Play pop animation
         playPopAnimation {
@@ -344,6 +473,7 @@ class FocusOrbsActivity : AppCompatActivity(), Choreographer.FrameCallback {
 
     /**
      * Spawn the orb at a random position within safe screen bounds.
+     * The orb stays fixed until popped (player must aim at it via head tilt).
      */
     private fun spawnNewOrb() {
         // Define safe margins to keep orb fully visible
@@ -356,7 +486,8 @@ class FocusOrbsActivity : AppCompatActivity(), Choreographer.FrameCallback {
         val maxY = (screenHeight - margin).toFloat()
 
         // Ensure the orb doesn't spawn too close to center (make player work for it!)
-        val minDistanceFromCenter = 150f
+        // Also ensure it spawns within the aimable range (MAX_AIM_OFFSET from center)
+        val minDistanceFromCenter = 100f
 
         var attempts = 0
         do {
@@ -364,7 +495,8 @@ class FocusOrbsActivity : AppCompatActivity(), Choreographer.FrameCallback {
             orbY = Random.nextFloat() * (maxY - minY) + minY
             val distanceFromCenter = hypot(orbX - centerX, orbY - centerY)
             attempts++
-        } while (distanceFromCenter < minDistanceFromCenter && attempts < 20)
+            // Make sure orb is reachable (within aim range) but not too close
+        } while ((distanceFromCenter < minDistanceFromCenter || distanceFromCenter > MAX_AIM_OFFSET) && attempts < 50)
 
         // Update visual position
         updateOrbPosition()
@@ -395,5 +527,11 @@ class FocusOrbsActivity : AppCompatActivity(), Choreographer.FrameCallback {
     private fun updateScoreDisplay() {
         binding.scoreText.text = "Score: $score"
     }
-}
 
+    /**
+     * Update the level display TextView.
+     */
+    private fun updateLevelDisplay() {
+        binding.levelText.text = "Level: $level"
+    }
+}
