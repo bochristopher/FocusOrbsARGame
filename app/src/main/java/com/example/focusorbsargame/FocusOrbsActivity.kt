@@ -2,12 +2,14 @@ package com.example.focusorbsargame
 
 import android.animation.AnimatorSet
 import android.animation.ObjectAnimator
+import android.annotation.SuppressLint
 import android.hardware.Sensor
 import android.hardware.SensorEvent
 import android.hardware.SensorEventListener
 import android.hardware.SensorManager
 import android.os.Bundle
 import android.view.Choreographer
+import android.view.MotionEvent
 import android.view.View
 import android.view.WindowManager
 import android.view.animation.AccelerateDecelerateInterpolator
@@ -74,10 +76,15 @@ class FocusOrbsActivity : AppCompatActivity(), Choreographer.FrameCallback, Sens
     private var currentPitch: Float = 0f
     private var currentRoll: Float = 0f
 
-    // Virtual aim offset from center (computed from head tilt)
+    // Virtual aim offset from center (computed from head tilt or touch)
     // This represents how far the aim point has moved from screen center
     private var aimOffsetX: Float = 0f
     private var aimOffsetY: Float = 0f
+
+    // Touch input fallback (for testing on emulator or devices without good sensors)
+    private var useTouchInput: Boolean = false
+    private var touchAimX: Float = 0f
+    private var touchAimY: Float = 0f
 
     // Rotation matrix and orientation arrays (reused to avoid allocation)
     private val rotationMatrix = FloatArray(9)
@@ -213,6 +220,16 @@ class FocusOrbsActivity : AppCompatActivity(), Choreographer.FrameCallback, Sens
         val deltaPitch = currentPitch - neutralPitch
         val deltaRoll = currentRoll - neutralRoll
 
+        // If using touch input, only switch back to sensor if there's significant head movement
+        if (useTouchInput) {
+            val significantMovement = kotlin.math.abs(deltaPitch) > 0.15f || kotlin.math.abs(deltaRoll) > 0.15f
+            if (significantMovement) {
+                useTouchInput = false  // Switch back to sensor input
+            } else {
+                return  // Keep using touch input
+            }
+        }
+
         // Map pitch/roll deltas to aim offset in screen pixels
         // Roll (left/right tilt) → horizontal aim offset (X)
         // Pitch (forward/back tilt) → vertical aim offset (Y)
@@ -227,6 +244,38 @@ class FocusOrbsActivity : AppCompatActivity(), Choreographer.FrameCallback, Sens
 
     override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {
         // Not used, but required by SensorEventListener interface
+    }
+
+    // ==================== Touch Input (Fallback for Testing) ====================
+
+    /**
+     * Handle touch events as fallback input method.
+     * Touch anywhere on screen to move the aim point there.
+     * Useful for testing on emulator or devices without proper sensors.
+     */
+    @SuppressLint("ClickableViewAccessibility")
+    override fun onTouchEvent(event: MotionEvent?): Boolean {
+        event ?: return super.onTouchEvent(event)
+
+        when (event.action) {
+            MotionEvent.ACTION_DOWN, MotionEvent.ACTION_MOVE -> {
+                // Switch to touch input mode
+                useTouchInput = true
+
+                // Store touch position as absolute aim point
+                touchAimX = event.x
+                touchAimY = event.y
+
+                // Update aim offset relative to center
+                aimOffsetX = touchAimX - centerX
+                aimOffsetY = touchAimY - centerY
+            }
+            MotionEvent.ACTION_UP -> {
+                // Keep using touch input, aim stays at last touched position
+                // This allows "tap to aim" behavior
+            }
+        }
+        return true
     }
 
     // ==================== Fullscreen Setup ====================
