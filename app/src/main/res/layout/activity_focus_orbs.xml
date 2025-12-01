@@ -61,12 +61,23 @@
         app:layout_constraintTop_toBottomOf="@id/scoreText"
         tools:visibility="visible" />
 
-    <!-- Center reticle - fixed at screen center (visual indicator only) -->
+    <!-- Center reticle - fixed reference point at screen center -->
     <View
         android:id="@+id/reticle"
         android:layout_width="48dp"
         android:layout_height="48dp"
         android:background="@drawable/reticle_circle"
+        app:layout_constraintBottom_toBottomOf="parent"
+        app:layout_constraintEnd_toEndOf="parent"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintTop_toTopOf="parent" />
+
+    <!-- Aim cursor - moves with head tilt to show where player is aiming -->
+    <View
+        android:id="@+id/aimCursor"
+        android:layout_width="24dp"
+        android:layout_height="24dp"
+        android:background="@drawable/aim_cursor"
         app:layout_constraintBottom_toBottomOf="parent"
         app:layout_constraintEnd_toEndOf="parent"
         app:layout_constraintStart_toStartOf="parent"

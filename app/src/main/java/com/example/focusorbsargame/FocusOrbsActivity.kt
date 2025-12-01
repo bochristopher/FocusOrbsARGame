@@ -2,14 +2,13 @@ package com.example.focusorbsargame
 
 import android.animation.AnimatorSet
 import android.animation.ObjectAnimator
-import android.annotation.SuppressLint
 import android.hardware.Sensor
 import android.hardware.SensorEvent
 import android.hardware.SensorEventListener
 import android.hardware.SensorManager
 import android.os.Bundle
 import android.view.Choreographer
-import android.view.MotionEvent
+import android.view.KeyEvent
 import android.view.View
 import android.view.WindowManager
 import android.view.animation.AccelerateDecelerateInterpolator
@@ -76,15 +75,10 @@ class FocusOrbsActivity : AppCompatActivity(), Choreographer.FrameCallback, Sens
     private var currentPitch: Float = 0f
     private var currentRoll: Float = 0f
 
-    // Virtual aim offset from center (computed from head tilt or touch)
+    // Virtual aim offset from center (computed from head tilt)
     // This represents how far the aim point has moved from screen center
     private var aimOffsetX: Float = 0f
     private var aimOffsetY: Float = 0f
-
-    // Touch input fallback (for testing on emulator or devices without good sensors)
-    private var useTouchInput: Boolean = false
-    private var touchAimX: Float = 0f
-    private var touchAimY: Float = 0f
 
     // Rotation matrix and orientation arrays (reused to avoid allocation)
     private val rotationMatrix = FloatArray(9)
@@ -98,6 +92,7 @@ class FocusOrbsActivity : AppCompatActivity(), Choreographer.FrameCallback, Sens
     private var screenHeight: Int = 0
     private var orbSize: Int = 0
     private var reticleSize: Int = 0
+    private var aimCursorSize: Int = 0
 
     // Screen center coordinates (where the reticle is visually positioned)
     private var centerX: Float = 0f
@@ -220,16 +215,6 @@ class FocusOrbsActivity : AppCompatActivity(), Choreographer.FrameCallback, Sens
         val deltaPitch = currentPitch - neutralPitch
         val deltaRoll = currentRoll - neutralRoll
 
-        // If using touch input, only switch back to sensor if there's significant head movement
-        if (useTouchInput) {
-            val significantMovement = kotlin.math.abs(deltaPitch) > 0.15f || kotlin.math.abs(deltaRoll) > 0.15f
-            if (significantMovement) {
-                useTouchInput = false  // Switch back to sensor input
-            } else {
-                return  // Keep using touch input
-            }
-        }
-
         // Map pitch/roll deltas to aim offset in screen pixels
         // Roll (left/right tilt) → horizontal aim offset (X)
         // Pitch (forward/back tilt) → vertical aim offset (Y)
@@ -246,36 +231,55 @@ class FocusOrbsActivity : AppCompatActivity(), Choreographer.FrameCallback, Sens
         // Not used, but required by SensorEventListener interface
     }
 
-    // ==================== Touch Input (Fallback for Testing) ====================
+    // ==================== Button Input (Rokid AR Glasses) ====================
 
     /**
-     * Handle touch events as fallback input method.
-     * Touch anywhere on screen to move the aim point there.
-     * Useful for testing on emulator or devices without proper sensors.
+     * Handle key/button events from Rokid AR glasses.
+     * Button press → recalibrate neutral orientation (reset where "center" is)
      */
-    @SuppressLint("ClickableViewAccessibility")
-    override fun onTouchEvent(event: MotionEvent?): Boolean {
-        event ?: return super.onTouchEvent(event)
-
-        when (event.action) {
-            MotionEvent.ACTION_DOWN, MotionEvent.ACTION_MOVE -> {
-                // Switch to touch input mode
-                useTouchInput = true
-
-                // Store touch position as absolute aim point
-                touchAimX = event.x
-                touchAimY = event.y
-
-                // Update aim offset relative to center
-                aimOffsetX = touchAimX - centerX
-                aimOffsetY = touchAimY - centerY
-            }
-            MotionEvent.ACTION_UP -> {
-                // Keep using touch input, aim stays at last touched position
-                // This allows "tap to aim" behavior
+    override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
+        // Handle various button codes that Rokid might send
+        // Common codes: KEYCODE_ENTER, KEYCODE_DPAD_CENTER, KEYCODE_BUTTON_A
+        when (keyCode) {
+            KeyEvent.KEYCODE_ENTER,
+            KeyEvent.KEYCODE_DPAD_CENTER,
+            KeyEvent.KEYCODE_BUTTON_A,
+            KeyEvent.KEYCODE_BUTTON_SELECT,
+            KeyEvent.KEYCODE_SPACE -> {
+                recalibrateNeutralOrientation()
+                return true
             }
         }
-        return true
+        return super.onKeyDown(keyCode, event)
+    }
+
+    /**
+     * Recalibrate the neutral orientation.
+     * Sets the current head position as the new "center" / neutral.
+     * Player should look straight ahead and press button.
+     */
+    private fun recalibrateNeutralOrientation() {
+        neutralPitch = currentPitch
+        neutralRoll = currentRoll
+        hasNeutralOrientation = true
+
+        // Reset aim offset to center
+        aimOffsetX = 0f
+        aimOffsetY = 0f
+
+        // Visual feedback: briefly flash the reticle
+        binding.reticle.animate()
+            .scaleX(1.5f)
+            .scaleY(1.5f)
+            .setDuration(100)
+            .withEndAction {
+                binding.reticle.animate()
+                    .scaleX(1f)
+                    .scaleY(1f)
+                    .setDuration(100)
+                    .start()
+            }
+            .start()
     }
 
     // ==================== Fullscreen Setup ====================
@@ -301,6 +305,7 @@ class FocusOrbsActivity : AppCompatActivity(), Choreographer.FrameCallback, Sens
         screenHeight = binding.gameContainer.height
         orbSize = binding.orb.width
         reticleSize = binding.reticle.width
+        aimCursorSize = binding.aimCursor.width
 
         // Calculate center of screen (where reticle is positioned)
         centerX = screenWidth / 2f
@@ -386,8 +391,24 @@ class FocusOrbsActivity : AppCompatActivity(), Choreographer.FrameCallback, Sens
         // Don't update if we're in the middle of a pop animation
         if (isPopping) return
 
+        // Update aim cursor visual position to match head tilt
+        updateAimCursorPosition()
+
         // Check alignment between virtual aim point and orb
         checkAlignment(deltaTime)
+    }
+
+    /**
+     * Update the visual aim cursor position based on current aim offset.
+     * This shows the player where they're currently aiming.
+     */
+    private fun updateAimCursorPosition() {
+        val aimX = centerX + aimOffsetX
+        val aimY = centerY + aimOffsetY
+
+        // Position the aim cursor (offset by half its size to center it)
+        binding.aimCursor.x = aimX - aimCursorSize / 2f
+        binding.aimCursor.y = aimY - aimCursorSize / 2f
     }
 
     // ==================== Orb Position ====================
