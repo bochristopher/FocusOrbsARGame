@@ -59,20 +59,16 @@ class FocusOrbsActivity : AppCompatActivity(), Choreographer.FrameCallback {
     // Accumulated focus time while aim point is within capture radius of orb
     private var currentFocusTime: Float = 0f
 
-    // ==================== Slider Touch Control ====================
-    // Virtual aim offset from center (controlled by slider touch)
-    // This represents how far the aim point has moved from screen center
+    // ==================== Tap Control ====================
+    // Virtual aim offset from center
     private var aimOffsetX: Float = 0f
     private var aimOffsetY: Float = 0f
 
-    // Touch tracking for slider
-    private var lastTouchX: Float = 0f
-    private var lastTouchY: Float = 0f
-    private var isTouching: Boolean = false
-
-    // Sensitivity: how many pixels to move aim per pixel of touch movement
-    private val sliderSensitivityX: Float = 3.0f  // Horizontal sensitivity
-    private val sliderSensitivityY: Float = 3.0f  // Vertical sensitivity (if slider supports it)
+    // Auto-moving aim cursor state
+    private var isAimMoving: Boolean = true      // Whether aim is currently moving (tap to stop)
+    private var aimAngle: Float = 0f             // Current angle in radians (for circular motion)
+    private var aimRadius: Float = 200f          // Current radius from center
+    private var aimRotationSpeed: Float = 2.0f   // Radians per second (how fast it spins)
 
     // ==================== Timing ====================
     private var lastFrameTimeNanos: Long = 0L
@@ -147,124 +143,75 @@ class FocusOrbsActivity : AppCompatActivity(), Choreographer.FrameCallback {
         stopGameLoop()
     }
 
-    // ==================== Slider Touch Input (Rokid AR Glasses) ====================
+    // ==================== Tap Input (Rokid AR Glasses) ====================
 
     /**
      * Handle touch events from the Rokid slider touch sensor.
-     * Swiping on the slider moves the aim cursor.
-     * The aim position is preserved between swipes.
+     * TAP: Stop/start the aim cursor movement.
+     * When stopped on the orb, the focus timer fills and orb pops.
      */
     override fun onTouchEvent(event: MotionEvent?): Boolean {
         event ?: return super.onTouchEvent(event)
 
         when (event.action) {
             MotionEvent.ACTION_DOWN -> {
-                // Start of touch - record initial position
-                lastTouchX = event.x
-                lastTouchY = event.y
-                isTouching = true
-            }
-
-            MotionEvent.ACTION_MOVE -> {
-                if (isTouching) {
-                    // Calculate how far the finger moved since last event
-                    val deltaX = event.x - lastTouchX
-                    val deltaY = event.y - lastTouchY
-
-                    // Apply sensitivity and add to aim offset
-                    aimOffsetX += deltaX * sliderSensitivityX
-                    aimOffsetY += deltaY * sliderSensitivityY
-
-                    // Clamp to max range
-                    aimOffsetX = aimOffsetX.coerceIn(-MAX_AIM_OFFSET, MAX_AIM_OFFSET)
-                    aimOffsetY = aimOffsetY.coerceIn(-MAX_AIM_OFFSET, MAX_AIM_OFFSET)
-
-                    // Update last position for next delta calculation
-                    lastTouchX = event.x
-                    lastTouchY = event.y
-                }
-            }
-
-            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
-                // End of touch - aim stays at current position
-                isTouching = false
+                // Tap detected - toggle aim movement
+                onTap()
+                return true
             }
         }
 
-        return true
+        return super.onTouchEvent(event)
     }
 
     /**
-     * Handle generic motion events (some Rokid models send slider data here).
+     * Handle tap action - toggle between moving and stopped aim cursor.
      */
-    override fun onGenericMotionEvent(event: MotionEvent?): Boolean {
-        event ?: return super.onGenericMotionEvent(event)
+    private fun onTap() {
+        if (isAimMoving) {
+            // Stop the aim cursor where it is
+            isAimMoving = false
 
-        // Handle trackpad/slider-style input
-        if (event.action == MotionEvent.ACTION_MOVE) {
-            val deltaX = event.x - lastTouchX
-            val deltaY = event.y - lastTouchY
-
-            if (lastTouchX != 0f || lastTouchY != 0f) {
-                aimOffsetX += deltaX * sliderSensitivityX
-                aimOffsetY += deltaY * sliderSensitivityY
-
-                aimOffsetX = aimOffsetX.coerceIn(-MAX_AIM_OFFSET, MAX_AIM_OFFSET)
-                aimOffsetY = aimOffsetY.coerceIn(-MAX_AIM_OFFSET, MAX_AIM_OFFSET)
-            }
-
-            lastTouchX = event.x
-            lastTouchY = event.y
-            return true
+            // Visual feedback - make aim cursor brighter/pulse
+            binding.aimCursor.animate()
+                .scaleX(1.3f)
+                .scaleY(1.3f)
+                .setDuration(100)
+                .withEndAction {
+                    binding.aimCursor.animate()
+                        .scaleX(1f)
+                        .scaleY(1f)
+                        .setDuration(100)
+                        .start()
+                }
+                .start()
+        } else {
+            // Resume aim cursor movement
+            isAimMoving = true
+            currentFocusTime = 0f  // Reset focus timer
+            binding.focusProgressBar.visibility = View.INVISIBLE
         }
-
-        return super.onGenericMotionEvent(event)
     }
 
     // ==================== Button Input (Rokid AR Glasses) ====================
 
     /**
      * Handle key/button events from Rokid AR glasses.
-     * Button press → recenter the aim cursor
+     * Button press → same as tap (stop/start aim cursor)
      */
     override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
         // Handle various button codes that Rokid might send
-        // Common codes: KEYCODE_ENTER, KEYCODE_DPAD_CENTER, KEYCODE_BUTTON_A
         when (keyCode) {
             KeyEvent.KEYCODE_ENTER,
             KeyEvent.KEYCODE_DPAD_CENTER,
             KeyEvent.KEYCODE_BUTTON_A,
             KeyEvent.KEYCODE_BUTTON_SELECT,
             KeyEvent.KEYCODE_SPACE -> {
-                recenterAim()
+                onTap()  // Button acts same as tap
                 return true
             }
         }
         return super.onKeyDown(keyCode, event)
-    }
-
-    /**
-     * Reset the aim cursor to center position.
-     * Press button to recenter the aim.
-     */
-    private fun recenterAim() {
-        // Reset aim offset to center
-        aimOffsetX = 0f
-        aimOffsetY = 0f
-
-        // Visual feedback: briefly flash the reticle
-        binding.reticle.animate()
-            .scaleX(1.5f)
-            .scaleY(1.5f)
-            .setDuration(100)
-            .withEndAction {
-                binding.reticle.animate()
-                    .scaleX(1f)
-                    .scaleY(1f)
-                    .setDuration(100)
-                    .start()
-            }
-            .start()
     }
 
     // ==================== Fullscreen Setup ====================
@@ -376,11 +323,35 @@ class FocusOrbsActivity : AppCompatActivity(), Choreographer.FrameCallback {
         // Don't update if we're in the middle of a pop animation
         if (isPopping) return
 
-        // Update aim cursor visual position to match head tilt
+        // Move aim cursor automatically if not stopped
+        if (isAimMoving) {
+            updateAutoAim(deltaTime)
+        }
+
+        // Update aim cursor visual position
         updateAimCursorPosition()
 
         // Check alignment between virtual aim point and orb
         checkAlignment(deltaTime)
+    }
+
+    /**
+     * Update the auto-moving aim cursor.
+     * The aim cursor moves in a circular pattern around the screen.
+     * Player taps to stop it when it's over the orb.
+     */
+    private fun updateAutoAim(deltaTime: Float) {
+        // Rotate the aim angle
+        aimAngle += aimRotationSpeed * deltaTime
+
+        // Keep angle in 0 to 2π range
+        if (aimAngle > 2 * Math.PI) {
+            aimAngle -= (2 * Math.PI).toFloat()
+        }
+
+        // Convert polar coordinates (angle, radius) to cartesian offset (x, y)
+        aimOffsetX = (kotlin.math.cos(aimAngle) * aimRadius)
+        aimOffsetY = (kotlin.math.sin(aimAngle) * aimRadius)
     }
 
     /**
@@ -412,15 +383,19 @@ class FocusOrbsActivity : AppCompatActivity(), Choreographer.FrameCallback {
 
     /**
      * Check if the virtual aim point is aligned with the orb.
-     *
-     * The aim point is: (centerX + aimOffsetX, centerY + aimOffsetY)
-     * This represents where the player is "looking" based on head tilt.
+     * Only counts when aim is STOPPED (player tapped to lock aim).
      *
      * If the aim point is within captureRadius of the orb center,
      * we accumulate focus time. Otherwise, we reset.
      */
     private fun checkAlignment(deltaTime: Float) {
-        // Calculate the virtual aim point based on head tilt
+        // Only check alignment when aim is stopped
+        if (isAimMoving) {
+            binding.focusProgressBar.visibility = View.INVISIBLE
+            return
+        }
+
+        // Calculate the virtual aim point
         val aimX = centerX + aimOffsetX
         val aimY = centerY + aimOffsetY
 
@@ -445,6 +420,9 @@ class FocusOrbsActivity : AppCompatActivity(), Choreographer.FrameCallback {
             currentFocusTime = 0f
             binding.focusProgressBar.visibility = View.INVISIBLE
             binding.focusProgressBar.progress = 0
+
+            // Auto-resume movement after a short delay if missed
+            // (Player needs to tap again to try)
         }
     }
 
@@ -467,8 +445,9 @@ class FocusOrbsActivity : AppCompatActivity(), Choreographer.FrameCallback {
 
         // Play pop animation
         playPopAnimation {
-            // After animation completes, spawn new orb
+            // After animation completes, spawn new orb and restart aim movement
             spawnNewOrb()
+            isAimMoving = true  // Resume auto-aim for next orb
             isPopping = false
         }
     }
@@ -528,7 +507,8 @@ class FocusOrbsActivity : AppCompatActivity(), Choreographer.FrameCallback {
 
     /**
      * Spawn the orb at a random position within safe screen bounds.
-     * The orb stays fixed until popped (player must aim at it via head tilt).
+     * The orb stays fixed until popped. Aim cursor will sweep in a circle
+     * at the same radius as the orb, so timing the tap is key.
      */
     private fun spawnNewOrb() {
         // Define safe margins to keep orb fully visible
@@ -542,7 +522,7 @@ class FocusOrbsActivity : AppCompatActivity(), Choreographer.FrameCallback {
 
         // Ensure the orb doesn't spawn too close to center (make player work for it!)
         // Also ensure it spawns within the aimable range (MAX_AIM_OFFSET from center)
-        val minDistanceFromCenter = 100f
+        val minDistanceFromCenter = 120f
 
         var attempts = 0
         do {
@@ -552,6 +532,10 @@ class FocusOrbsActivity : AppCompatActivity(), Choreographer.FrameCallback {
             attempts++
             // Make sure orb is reachable (within aim range) but not too close
         } while ((distanceFromCenter < minDistanceFromCenter || distanceFromCenter > MAX_AIM_OFFSET) && attempts < 50)
+
+        // Set aim radius to match orb's distance from center
+        // This ensures the sweeping aim cursor will pass over the orb
+        aimRadius = hypot(orbX - centerX, orbY - centerY)
 
         // Update visual position
         updateOrbPosition()
