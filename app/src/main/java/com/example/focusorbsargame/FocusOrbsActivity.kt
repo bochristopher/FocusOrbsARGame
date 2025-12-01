@@ -2,13 +2,10 @@ package com.example.focusorbsargame
 
 import android.animation.AnimatorSet
 import android.animation.ObjectAnimator
-import android.hardware.Sensor
-import android.hardware.SensorEvent
-import android.hardware.SensorEventListener
-import android.hardware.SensorManager
 import android.os.Bundle
 import android.view.Choreographer
 import android.view.KeyEvent
+import android.view.MotionEvent
 import android.view.View
 import android.view.WindowManager
 import android.view.animation.AccelerateDecelerateInterpolator
@@ -37,7 +34,7 @@ import kotlin.random.Random
  * - When aim point is close to orb for required duration, orb "pops"
  * - Score increases, difficulty ramps up, new orb spawns
  */
-class FocusOrbsActivity : AppCompatActivity(), Choreographer.FrameCallback, SensorEventListener {
+class FocusOrbsActivity : AppCompatActivity(), Choreographer.FrameCallback {
 
     // ==================== View Binding ====================
     private lateinit var binding: ActivityFocusOrbsBinding
@@ -62,27 +59,20 @@ class FocusOrbsActivity : AppCompatActivity(), Choreographer.FrameCallback, Sens
     // Accumulated focus time while aim point is within capture radius of orb
     private var currentFocusTime: Float = 0f
 
-    // ==================== Head Tilt / Orientation ====================
-    private lateinit var sensorManager: SensorManager
-    private var rotationVectorSensor: Sensor? = null
-
-    // Neutral orientation (captured when game starts or recalibrates)
-    private var neutralPitch: Float = 0f
-    private var neutralRoll: Float = 0f
-    private var hasNeutralOrientation: Boolean = false
-
-    // Current orientation from sensor
-    private var currentPitch: Float = 0f
-    private var currentRoll: Float = 0f
-
-    // Virtual aim offset from center (computed from head tilt)
+    // ==================== Slider Touch Control ====================
+    // Virtual aim offset from center (controlled by slider touch)
     // This represents how far the aim point has moved from screen center
     private var aimOffsetX: Float = 0f
     private var aimOffsetY: Float = 0f
 
-    // Rotation matrix and orientation arrays (reused to avoid allocation)
-    private val rotationMatrix = FloatArray(9)
-    private val orientationAngles = FloatArray(3)
+    // Touch tracking for slider
+    private var lastTouchX: Float = 0f
+    private var lastTouchY: Float = 0f
+    private var isTouching: Boolean = false
+
+    // Sensitivity: how many pixels to move aim per pixel of touch movement
+    private val sliderSensitivityX: Float = 3.0f  // Horizontal sensitivity
+    private val sliderSensitivityY: Float = 3.0f  // Vertical sensitivity (if slider supports it)
 
     // ==================== Timing ====================
     private var lastFrameTimeNanos: Long = 0L
@@ -116,11 +106,6 @@ class FocusOrbsActivity : AppCompatActivity(), Choreographer.FrameCallback, Sens
         // Pops required to level up
         private const val POPS_PER_LEVEL = 5
 
-        // Head tilt sensitivity: how many pixels of aim offset per radian of tilt
-        // Higher = more sensitive, aim moves more for same head tilt
-        private const val TILT_SENSITIVITY_X = 400f   // pixels per radian for roll (left/right tilt)
-        private const val TILT_SENSITIVITY_Y = 400f   // pixels per radian for pitch (up/down tilt)
-
         // Maximum aim offset from center (prevents aiming off-screen)
         private const val MAX_AIM_OFFSET = 350f
     }
@@ -140,10 +125,6 @@ class FocusOrbsActivity : AppCompatActivity(), Choreographer.FrameCallback, Sens
         // Enable immersive fullscreen mode
         setupFullscreen()
 
-        // Initialize sensor manager
-        sensorManager = getSystemService(SENSOR_SERVICE) as SensorManager
-        rotationVectorSensor = sensorManager.getDefaultSensor(Sensor.TYPE_ROTATION_VECTOR)
-
         // Initialize UI
         updateScoreDisplay()
         updateLevelDisplay()
@@ -158,84 +139,93 @@ class FocusOrbsActivity : AppCompatActivity(), Choreographer.FrameCallback, Sens
 
     override fun onResume() {
         super.onResume()
-
-        // Register sensor listener for head tracking
-        rotationVectorSensor?.let { sensor ->
-            sensorManager.registerListener(
-                this,
-                sensor,
-                SensorManager.SENSOR_DELAY_GAME  // ~20ms updates, good for games
-            )
-        }
-
-        // Reset neutral orientation so it recalibrates when player resumes
-        hasNeutralOrientation = false
-
         startGameLoop()
     }
 
     override fun onPause() {
         super.onPause()
-
-        // Unregister sensor listener to save battery
-        sensorManager.unregisterListener(this)
-
         stopGameLoop()
     }
 
-    // ==================== Sensor Event Handling ====================
+    // ==================== Slider Touch Input (Rokid AR Glasses) ====================
 
     /**
-     * Called when sensor values change.
-     * We extract pitch and roll from the rotation vector to determine head tilt.
+     * Handle touch events from the Rokid slider touch sensor.
+     * Swiping on the slider moves the aim cursor.
+     * The aim position is preserved between swipes.
      */
-    override fun onSensorChanged(event: SensorEvent?) {
-        if (event?.sensor?.type != Sensor.TYPE_ROTATION_VECTOR) return
+    override fun onTouchEvent(event: MotionEvent?): Boolean {
+        event ?: return super.onTouchEvent(event)
 
-        // Convert rotation vector to rotation matrix
-        SensorManager.getRotationMatrixFromVector(rotationMatrix, event.values)
+        when (event.action) {
+            MotionEvent.ACTION_DOWN -> {
+                // Start of touch - record initial position
+                lastTouchX = event.x
+                lastTouchY = event.y
+                isTouching = true
+            }
 
-        // Get orientation angles: [azimuth, pitch, roll]
-        // azimuth: rotation around Z axis (compass direction) - not used
-        // pitch: rotation around X axis (tilting phone forward/back)
-        // roll: rotation around Y axis (tilting phone left/right)
-        SensorManager.getOrientation(rotationMatrix, orientationAngles)
+            MotionEvent.ACTION_MOVE -> {
+                if (isTouching) {
+                    // Calculate how far the finger moved since last event
+                    val deltaX = event.x - lastTouchX
+                    val deltaY = event.y - lastTouchY
 
-        currentPitch = orientationAngles[1]  // radians, negative = tilted forward
-        currentRoll = orientationAngles[2]   // radians, positive = tilted right
+                    // Apply sensitivity and add to aim offset
+                    aimOffsetX += deltaX * sliderSensitivityX
+                    aimOffsetY += deltaY * sliderSensitivityY
 
-        // Capture neutral orientation on first stable reading
-        if (!hasNeutralOrientation) {
-            neutralPitch = currentPitch
-            neutralRoll = currentRoll
-            hasNeutralOrientation = true
+                    // Clamp to max range
+                    aimOffsetX = aimOffsetX.coerceIn(-MAX_AIM_OFFSET, MAX_AIM_OFFSET)
+                    aimOffsetY = aimOffsetY.coerceIn(-MAX_AIM_OFFSET, MAX_AIM_OFFSET)
+
+                    // Update last position for next delta calculation
+                    lastTouchX = event.x
+                    lastTouchY = event.y
+                }
+            }
+
+            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                // End of touch - aim stays at current position
+                isTouching = false
+            }
         }
 
-        // Compute delta from neutral orientation
-        val deltaPitch = currentPitch - neutralPitch
-        val deltaRoll = currentRoll - neutralRoll
-
-        // Map pitch/roll deltas to aim offset in screen pixels
-        // Roll (left/right tilt) → horizontal aim offset (X)
-        // Pitch (forward/back tilt) → vertical aim offset (Y)
-        //
-        // Note: The mapping may need adjustment based on device orientation.
-        // For portrait mode:
-        //   - Roll right (positive) → aim moves right (+X)
-        //   - Pitch forward (negative) → aim moves up (-Y in screen coords)
-        aimOffsetX = (deltaRoll * TILT_SENSITIVITY_X).coerceIn(-MAX_AIM_OFFSET, MAX_AIM_OFFSET)
-        aimOffsetY = (-deltaPitch * TILT_SENSITIVITY_Y).coerceIn(-MAX_AIM_OFFSET, MAX_AIM_OFFSET)
+        return true
     }
 
-    override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {
-        // Not used, but required by SensorEventListener interface
+    /**
+     * Handle generic motion events (some Rokid models send slider data here).
+     */
+    override fun onGenericMotionEvent(event: MotionEvent?): Boolean {
+        event ?: return super.onGenericMotionEvent(event)
+
+        // Handle trackpad/slider-style input
+        if (event.action == MotionEvent.ACTION_MOVE) {
+            val deltaX = event.x - lastTouchX
+            val deltaY = event.y - lastTouchY
+
+            if (lastTouchX != 0f || lastTouchY != 0f) {
+                aimOffsetX += deltaX * sliderSensitivityX
+                aimOffsetY += deltaY * sliderSensitivityY
+
+                aimOffsetX = aimOffsetX.coerceIn(-MAX_AIM_OFFSET, MAX_AIM_OFFSET)
+                aimOffsetY = aimOffsetY.coerceIn(-MAX_AIM_OFFSET, MAX_AIM_OFFSET)
+            }
+
+            lastTouchX = event.x
+            lastTouchY = event.y
+            return true
+        }
+
+        return super.onGenericMotionEvent(event)
     }
 
     // ==================== Button Input (Rokid AR Glasses) ====================
 
     /**
      * Handle key/button events from Rokid AR glasses.
-     * Button press → recalibrate neutral orientation (reset where "center" is)
+     * Button press → recenter the aim cursor
      */
     override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
         // Handle various button codes that Rokid might send
@@ -246,7 +236,7 @@ class FocusOrbsActivity : AppCompatActivity(), Choreographer.FrameCallback, Sens
             KeyEvent.KEYCODE_BUTTON_A,
             KeyEvent.KEYCODE_BUTTON_SELECT,
             KeyEvent.KEYCODE_SPACE -> {
-                recalibrateNeutralOrientation()
+                recenterAim()
                 return true
             }
         }
@@ -254,15 +244,10 @@ class FocusOrbsActivity : AppCompatActivity(), Choreographer.FrameCallback, Sens
     }
 
     /**
-     * Recalibrate the neutral orientation.
-     * Sets the current head position as the new "center" / neutral.
-     * Player should look straight ahead and press button.
+     * Reset the aim cursor to center position.
+     * Press button to recenter the aim.
      */
-    private fun recalibrateNeutralOrientation() {
-        neutralPitch = currentPitch
-        neutralRoll = currentRoll
-        hasNeutralOrientation = true
-
+    private fun recenterAim() {
         // Reset aim offset to center
         aimOffsetX = 0f
         aimOffsetY = 0f
